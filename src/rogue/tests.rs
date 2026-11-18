@@ -29,7 +29,7 @@ fn an_experiment_disarms_itself_once_its_remaining_time_is_spent() {
 #[tokio::test]
 async fn a_delay_is_spent_inside_the_timeout_and_one_as_long_times_the_call_out() {
     let experiments = Experiments::default();
-    let delay = Fault::Delay { ns: crate::budget::nanos(10 * MS) };
+    let delay = Fault::Delay(10 * MS);
     experiments.apply(&[armed(Target::Verifier, delay, Duration::from_secs(60))]);
     assert_eq!(experiments.inject(Target::Verifier, 50 * MS).await, Injected::Pass(40 * MS));
     assert_eq!(experiments.inject(Target::Verifier, 10 * MS).await, Injected::TimedOut);
@@ -43,7 +43,7 @@ async fn stored_experiments_replace_per_target_expire_and_refuse_unsafe_rows() {
     let fraction = Fraction::new(500_000).expect("half");
     let hour = Duration::from_hours(1);
     store.arm_experiment(Target::Provider, Fault::Raise, fraction, hour).await.expect("arm");
-    let delay = Fault::Delay { ns: crate::budget::nanos(250 * MS) };
+    let delay = Fault::Delay(250 * MS);
     store.arm_experiment(Target::Provider, delay, fraction, hour).await.expect("replace");
     store.arm_experiment(Target::Feedback, Fault::Garble, Fraction::ALL, MS).await.expect("arm");
     tokio::time::sleep(10 * MS).await;
@@ -120,7 +120,7 @@ mod ses {
     #[tokio::test]
     async fn a_delay_past_the_send_timeout_is_an_unknown_outcome_without_a_send() {
         let server = endpoint(200, r#"{"MessageId":"real-id"}"#, false).await;
-        let delay = Fault::Delay { ns: u64::MAX };
+        let delay = Fault::Delay(Duration::MAX);
         let provider =
             SesProvider::new(aws(&server), None).with_experiments(rogue(Target::Provider, delay));
         let deadline = crate::budget::after(crate::provider::SEND_FLOOR + 100 * MS);

@@ -16,10 +16,13 @@ pub mod test_support;
 pub mod verify_guard;
 
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use breaker_machines::{AsyncCircuitBreaker, CircuitError, PredicateClassifier};
+use breaker_machines::{
+    AsyncCircuitBreaker, CircuitError, Policy, PredicateClassifier, Recovery, Threshold,
+};
 use deadline_machines::Deadline;
 use thiserror::Error;
 
@@ -111,6 +114,25 @@ fn send_timeout(deadline: Deadline, cap: Duration) -> Result<Duration, ProviderE
 /// unknown outcomes count; a rejection or invalid input never trips it. An
 /// armed [`Target::Provider`] experiment runs inside it, so injected faults
 /// reach the breaker the way real ones do.
+/// Five counted failures in thirty seconds open the circuit; it probes one
+/// send at a time after fifteen and closes after two successes.
+const SEND_POLICY: Policy = {
+    let (Some(failures), Some(successes)) = (NonZeroU32::new(5), NonZeroU32::new(2)) else {
+        panic!("a breaker counts at least one failure and one probe");
+    };
+    let Some(threshold) = Threshold::new(Some(failures), None, 0) else {
+        panic!("a failure count is a valid threshold");
+    };
+    let Some(recovery) = Recovery::new(Duration::from_secs(15), 0.0, successes, NonZeroU32::MIN)
+    else {
+        panic!("no jitter is a valid cooldown");
+    };
+    match Policy::new(threshold, Duration::from_secs(30), recovery, None) {
+        Some(policy) => policy,
+        None => panic!("the failure window is zero"),
+    }
+};
+
 struct SendCircuit {
     breaker: AsyncCircuitBreaker,
     provider: &'static str,
@@ -122,12 +144,8 @@ impl SendCircuit {
         Self {
             provider,
             experiments: Arc::default(),
-            breaker: AsyncCircuitBreaker::builder(name)
-                .failure_threshold(5)
-                .failure_window_secs(30.0)
-                .half_open_timeout_secs(15.0)
-                .success_threshold(2)
-                .failure_classifier(Arc::new(PredicateClassifier::new(|context| {
+            breaker: AsyncCircuitBreaker::builder(name, SEND_POLICY)
+                .classifier(PredicateClassifier::new(|context| {
                     context.error.downcast_ref::<ProviderError>().map_or_else(
                         || {
                             context
@@ -137,7 +155,7 @@ impl SendCircuit {
                         },
                         ProviderError::counts_as_failure,
                     )
-                })))
+                }))
                 .build_async(),
         }
     }

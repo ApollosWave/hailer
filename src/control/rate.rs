@@ -1,6 +1,8 @@
+use std::num::NonZeroU64;
+use std::time::Duration;
+
 use sqlx::{PgPool, Row};
-use throttle_machines::gate::Gate;
-use throttle_machines::token_bucket::{TokenBucket, TokenBucketParams, TokenBucketState};
+use throttle_machines::{Gate, TokenBucket, TokenBucketPolicy};
 
 use crate::config::RateLimitConfig;
 
@@ -27,7 +29,7 @@ impl Limiter {
 
     /// Reserves the entire envelope or consumes no tokens at all. State only
     /// commits on full admission, matching `TokenBucket::check`'s own
-    /// behavior on denial (it reports a refill without being asked to persist it).
+    /// behavior on denial (a refused call changes nothing).
     pub(super) async fn admit(&self, recipients: usize) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
@@ -37,35 +39,27 @@ impl Limiter {
         )
         .fetch_one(&mut *tx)
         .await?;
-        let params = TokenBucketParams {
-            capacity: row.try_get("capacity")?,
-            refill_rate: row.try_get("refill_rate")?,
-        };
-        let now: f64 = row.try_get("now")?;
-        let mut state = TokenBucketState {
-            tokens: row.try_get("tokens")?,
-            last_refill: row.try_get("last_refill")?,
-        };
-        let mut allowed = true;
-        for _ in 0..recipients {
-            let decision = TokenBucket::check(state, now, params);
-            if !decision.allowed {
-                allowed = false;
-                break;
-            }
-            state = decision.state;
-        }
-        if allowed {
+        let now = Duration::try_from_secs_f64(row.try_get("now")?)?;
+        let bucket = bucket(
+            row.try_get("capacity")?,
+            row.try_get("refill_rate")?,
+            row.try_get("tokens")?,
+            row.try_get("last_refill")?,
+        )?;
+        let admitted = bucket.and_then(|mut bucket| {
+            (0..recipients).all(|_| bucket.check(now).is_ok()).then_some(bucket)
+        });
+        if let Some(bucket) = admitted {
             sqlx::query(
                 "UPDATE hailer.send_rate_limiter SET tokens = $1, last_refill = $2 WHERE id = 1",
             )
-            .bind(state.tokens)
-            .bind(state.last_refill)
+            .bind(count(bucket.tokens()))
+            .bind(bucket.refilled_at().as_secs_f64())
             .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
-        Ok(allowed)
+        Ok(admitted.is_some())
     }
 
     /// Called by the AWS-discovery reconcile loop. Capacity tracks the
@@ -82,4 +76,44 @@ impl Limiter {
         .await?;
         Ok(())
     }
+}
+
+/// The stored row as a bucket on the database's clock, in seconds since the
+/// Unix epoch; `None` for a capacity below one token, which admits nothing.
+/// A stored fraction of a token becomes the time already earned toward the
+/// next one.
+fn bucket(
+    capacity: f64,
+    refill_rate: f64,
+    tokens: f64,
+    last_refill: f64,
+) -> anyhow::Result<Option<TokenBucket>> {
+    let Some(capacity) = NonZeroU64::new(whole(capacity)) else {
+        return Ok(None);
+    };
+    let refill_every = Duration::try_from_secs_f64(refill_rate.recip())?;
+    let policy = TokenBucketPolicy::new(capacity, refill_every).ok_or_else(|| {
+        anyhow::anyhow!("refill rate {refill_rate} is above one token a nanosecond")
+    })?;
+    let held = whole(tokens).min(capacity.get());
+    let earned = Duration::try_from_secs_f64(tokens.max(0.0).fract() / refill_rate)?;
+    let refilled_at = Duration::try_from_secs_f64(last_refill)?.saturating_sub(earned);
+    Ok(TokenBucket::restored(policy, held, refilled_at))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a float cast saturates: negative and NaN are zero tokens"
+)]
+const fn whole(tokens: f64) -> u64 {
+    tokens as u64
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "at most the capacity, which the row holds as a double"
+)]
+const fn count(tokens: u64) -> f64 {
+    tokens as f64
 }

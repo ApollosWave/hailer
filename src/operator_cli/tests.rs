@@ -86,7 +86,7 @@ fn arm(target: &str, fault: &str, delay_ms: Option<u64>, percent: f64, expires: 
 #[test]
 fn arming_from_the_cli_requires_a_bounded_expiry_and_a_fault_the_target_supports() {
     let delay = experiment(&arm("provider", "delay", Some(250), 0.01, 300)).expect("delay");
-    assert_eq!(delay.fault, Fault::Delay { ns: crate::budget::nanos(Duration::from_millis(250)) });
+    assert_eq!(delay.fault, Fault::Delay(Duration::from_millis(250)));
     assert_eq!(delay.fraction.millionths(), 100);
     assert_eq!(delay.remaining, Duration::from_secs(300));
     for invalid in [

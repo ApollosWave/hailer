@@ -6,7 +6,7 @@ mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use behavior_machines::{Node, Status};
+use behavior_machines::{Status, Step};
 use behavior_machines_circuit::{Lowered, State};
 
 use crate::config::RateLimitConfig;
@@ -72,13 +72,13 @@ pub struct Policy {
 
 impl Policy {
     pub fn new() -> anyhow::Result<Self> {
-        let branches = LEAVES[..8]
-            .as_chunks::<2>()
-            .0
+        let (guarded, fallback) = LEAVES.as_chunks::<2>();
+        let branches = guarded
             .iter()
-            .map(|pair| Node::sequence([Node::leaf(pair[0]), Node::leaf(pair[1])]))
-            .chain(std::iter::once(Node::leaf(LEAVES[8])));
-        let lowered = Lowered::new(&Node::reactive_fallback(branches))?;
+            .flat_map(|pair| [Step::Sequence(2), Step::Leaf(pair[0]), Step::Leaf(pair[1])])
+            .chain(fallback.iter().copied().map(Step::Leaf));
+        let root = Step::ReactiveFallback(guarded.len() + fallback.len());
+        let lowered = Lowered::new(std::iter::once(root).chain(branches))?;
         anyhow::ensure!(lowered.plan().leaf_count() == LEAVES.len(), "invalid admission circuit");
         Ok(Self { lowered })
     }

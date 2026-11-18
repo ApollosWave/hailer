@@ -10,7 +10,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deadline_machines::{Clock, NS_PER_SECOND, SystemClock};
 use supervisor_machines::{Decision, Exit, Intensity, Policy, Strategy, Supervisor};
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +35,11 @@ mod ses;
 /// and the rogue experiment watcher.
 const WORKERS: usize = 5;
 const RESTART_HISTORY: usize = 8;
-const RESTART_INTENSITY: Intensity = Intensity::new(3, 60 * NS_PER_SECOND);
+const RESTART_INTENSITY: Intensity = match Intensity::new(3, Duration::from_mins(1)) {
+    Some(intensity) => intensity,
+    None => panic!("the restart window is zero"),
+};
+const _: () = assert!(WORKERS > 0 && RESTART_HISTORY > RESTART_INTENSITY.restarts() as usize);
 const RESTART_BASE: Duration = Duration::from_secs(1);
 const RESTART_CEILING: Duration = Duration::from_secs(30);
 
@@ -62,7 +65,6 @@ struct Crew {
     workers: Vec<Worker>,
     running: HashMap<Id, usize>,
     tree: Supervisor<WORKERS, RESTART_HISTORY>,
-    clock: SystemClock,
     stop: CancellationToken,
     base: Duration,
     ceiling: Duration,
@@ -74,8 +76,7 @@ impl Crew {
             tasks: JoinSet::new(),
             workers: Vec::with_capacity(WORKERS),
             running: HashMap::new(),
-            tree: Supervisor::new(Strategy::OneForOne, RESTART_INTENSITY),
-            clock: crate::budget::clock(),
+            tree: crew_tree(),
             stop,
             base,
             ceiling,
@@ -129,14 +130,10 @@ impl Crew {
                     Exit::Abnormal
                 }
             };
-            let now = self.clock.now_ns();
+            let now = crate::budget::now();
             match self.tree.stopped(index, Policy::Permanent, exit, now) {
-                Decision::Restart(_) => {
-                    let delay = Duration::from_nanos(self.tree.restart_delay_ns(
-                        crate::budget::nanos(self.base),
-                        crate::budget::nanos(self.ceiling),
-                        now,
-                    ));
+                Ok(Decision::Restart(_)) => {
+                    let delay = self.tree.restart_delay(self.base, self.ceiling, now);
                     warn!(
                         worker,
                         recent_restarts = self.tree.recent_restarts(now),
@@ -145,14 +142,25 @@ impl Crew {
                     );
                     self.start(index, delay);
                 }
-                Decision::Ignore => {}
-                Decision::Escalate => {
+                Ok(Decision::Ignore) => {}
+                Ok(Decision::Escalate | Decision::AlreadyEscalated) => {
                     error!(worker, "Worker restart intensity exceeded");
+                    return true;
+                }
+                Err(refusal) => {
+                    error!(worker, %refusal, "Supervision could not decide on a worker's exit");
                     return true;
                 }
             }
         }
     }
+}
+
+fn crew_tree() -> Supervisor<WORKERS, RESTART_HISTORY> {
+    let Some(tree) = Supervisor::new(Strategy::OneForOne, RESTART_INTENSITY) else {
+        unreachable!("workers to supervise, and a history longer than the restarts tolerated")
+    };
+    tree
 }
 
 // One-time startup wiring, called from exactly one place (main.rs); grouping

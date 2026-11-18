@@ -3,7 +3,7 @@
 //! with nothing armed costs a read lock and one relaxed load.
 //!
 //! Expiries are computed by PostgreSQL as time remaining, then counted down
-//! on [`crate::budget::clock`], so no two hosts' wall clocks are compared.
+//! on [`crate::budget::now`], so no two hosts' wall clocks are compared.
 
 #[cfg(test)]
 mod tests;
@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use deadline_machines::Clock;
-use rogue_machines::{Decision, Experiment, Fault, Fraction, PER_MILLION, Rogue, Slot};
+use rogue_machines::{Decision, Draw, Experiment, Fault, Fraction, PER_MILLION, Rogue, Slot};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -64,7 +63,7 @@ impl Target {
 pub const fn fault_name(fault: Fault) -> &'static str {
     match fault {
         Fault::Raise => "raise",
-        Fault::Delay { .. } => "delay",
+        Fault::Delay(_) => "delay",
         Fault::Garble => "garble",
     }
 }
@@ -72,7 +71,7 @@ pub const fn fault_name(fault: Fault) -> &'static str {
 fn fault(name: &str, delay_ms: u64) -> anyhow::Result<Fault> {
     Ok(match name {
         "raise" => Fault::Raise,
-        "delay" => Fault::Delay { ns: crate::budget::nanos(Duration::from_millis(delay_ms)) },
+        "delay" => Fault::Delay(Duration::from_millis(delay_ms)),
         "garble" => Fault::Garble,
         other => anyhow::bail!("unknown rogue fault {other}"),
     })
@@ -90,7 +89,7 @@ pub struct Armed {
 impl Armed {
     pub fn to_json(self) -> serde_json::Value {
         let delay_ms = match self.fault {
-            Fault::Delay { ns } => Duration::from_nanos(ns).as_millis(),
+            Fault::Delay(delay) => delay.as_millis(),
             Fault::Raise | Fault::Garble => 0,
         };
         serde_json::json!({
@@ -121,7 +120,13 @@ impl Experiments {
         if !rogue.any_armed() {
             return None;
         }
-        match rogue.decide(target.slot(), crate::budget::clock().now_ns(), draw()) {
+        let now = crate::budget::now();
+        if rogue.live_count(now) == 0 {
+            drop(rogue);
+            self.0.write().unwrap_or_else(PoisonError::into_inner).sweep(now);
+            return None;
+        }
+        match rogue.decide(target.slot(), now, draw()?) {
             Decision::Pass => None,
             Decision::Inject(fault) => Some(fault),
         }
@@ -134,8 +139,7 @@ impl Experiments {
             None => Injected::Pass(timeout),
             Some(Fault::Raise) => Injected::Raise,
             Some(Fault::Garble) => Injected::Garble(timeout),
-            Some(Fault::Delay { ns }) => {
-                let delay = Duration::from_nanos(ns);
+            Some(Fault::Delay(delay)) => {
                 tokio::time::sleep(delay.min(timeout)).await;
                 timeout
                     .checked_sub(delay)
@@ -147,29 +151,33 @@ impl Experiments {
 
     /// Arms exactly `armed` and disarms every other target.
     pub fn apply(&self, armed: &[Armed]) {
-        let now = crate::budget::clock().now_ns();
+        let now = crate::budget::now();
         let mut rogue = self.0.write().unwrap_or_else(PoisonError::into_inner);
         for target in Target::ALL {
             match armed.iter().find(|experiment| experiment.target == target) {
-                Some(experiment) => rogue.arm(
-                    target.slot(),
-                    Experiment::new(
-                        experiment.fault,
-                        experiment.fraction,
-                        now.saturating_add(crate::budget::nanos(experiment.remaining)),
-                    ),
-                ),
-                None => rogue.disarm(target.slot()),
+                Some(experiment) => {
+                    rogue.arm(
+                        target.slot(),
+                        Experiment::new(
+                            experiment.fault,
+                            experiment.fraction,
+                            now.saturating_add(experiment.remaining),
+                        ),
+                    );
+                }
+                None => {
+                    rogue.disarm(target.slot());
+                }
             }
         }
     }
 }
 
 /// A draw below [`PER_MILLION`].
-fn draw() -> u32 {
+fn draw() -> Option<Draw> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let hash = RandomState::new().hash_one(SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    u32::try_from(hash % u64::from(PER_MILLION)).unwrap_or_default()
+    Draw::new(u32::try_from(hash % u64::from(PER_MILLION)).ok()?)
 }
 
 impl Store {
@@ -181,7 +189,7 @@ impl Store {
         expires_in: Duration,
     ) -> anyhow::Result<()> {
         let delay_ms = match fault {
-            Fault::Delay { ns } => i64::try_from(Duration::from_nanos(ns).as_millis())?,
+            Fault::Delay(delay) => i64::try_from(delay.as_millis())?,
             Fault::Raise | Fault::Garble => 0,
         };
         sqlx::query(

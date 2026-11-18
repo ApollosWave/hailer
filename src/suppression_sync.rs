@@ -6,10 +6,11 @@ mod tests;
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroU8;
 use std::time::Duration;
 
 use anyhow::ensure;
-use chrono_machines::{AsyncRetryable, ExponentialBackoff, RetryError, RetryOutcome};
+use chrono_machines::{Exponential, Retry, Strategy};
 use serde::Serialize;
 use sqlx::postgres::PgAdvisoryLock;
 use sqlx::{Connection, Either};
@@ -111,18 +112,24 @@ async fn run_locked(source: &impl Source, store: &Store, restart: bool) -> anyho
 /// then two between them. Anything else is a token or access problem that a
 /// retry cannot fix.
 async fn read_page(source: &impl Source, token: Option<&str>) -> Result<Page, ReadError> {
-    (|| source.page(token))
-        .retry_async(
-            ExponentialBackoff::new()
-                .max_attempts(3)
-                .base_delay_ms(1_000)
-                .multiplier(2.0)
-                .max_delay_ms(3_000)
-                .jitter_factor(0.25),
-        )
-        .when(|error| *error == ReadError::Unavailable)
-        .call_async(|ms| tokio::time::sleep(Duration::from_millis(ms)))
-        .await
-        .map(RetryOutcome::into_inner)
-        .map_err(RetryError::into_cause)
+    let mut reads = READS;
+    loop {
+        let error = match source.page(token).await {
+            Ok(page) => return Ok(page),
+            Err(error) => error,
+        };
+        if error != ReadError::Unavailable {
+            return Err(error);
+        }
+        let Ok(delay) = reads.failed(rand::random()) else {
+            return Err(error);
+        };
+        tokio::time::sleep(delay).await;
+    }
 }
+
+const READS: Retry =
+    match Exponential::new(Duration::from_secs(1), 2.0, Duration::from_secs(3), 0.25) {
+        Some(shape) => Retry::new(Strategy::Exponential(shape), NonZeroU8::new(3)),
+        None => panic!("the page read backoff's base is above its ceiling"),
+    };

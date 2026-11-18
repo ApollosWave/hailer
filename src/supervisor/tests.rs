@@ -38,7 +38,7 @@ async fn a_worker_that_keeps_dying_escalates_once_intensity_is_spent() {
     let starts = Arc::new(AtomicUsize::new(0));
     crew.enlist(counted(&starts, |_| Box::pin(async { anyhow::bail!("boom") })));
     assert!(crew.supervise(std::future::pending()).await);
-    let restarts = usize::try_from(RESTART_INTENSITY.restarts).expect("small");
+    let restarts = usize::try_from(RESTART_INTENSITY.restarts()).expect("small");
     assert_eq!(starts.load(Ordering::SeqCst), restarts + 1);
 }
 

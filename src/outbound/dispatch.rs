@@ -1,4 +1,8 @@
+use std::num::NonZeroU8;
+use std::time::Duration;
+
 use anyhow::ensure;
+use chrono_machines::Exponential;
 use sqlx::types::Json;
 use sqlx::{Postgres, Row, Transaction};
 
@@ -22,14 +26,17 @@ pub(super) struct Ticket {
     pub request: SendRequest,
 }
 
+/// One second doubling to ten minutes, up to a quarter off each delay.
+const RETRY: Exponential =
+    match Exponential::new(Duration::from_secs(1), 2.0, Duration::from_mins(10), 0.25) {
+        Some(shape) => shape,
+        None => panic!("the send retry backoff's base is above its ceiling"),
+    };
+
+/// Milliseconds to hold a message back before its `ordinal`th retry.
 pub(super) fn retry_delay(ordinal: i32) -> u64 {
-    chrono_machines::Policy {
-        max_attempts: u8::MAX,
-        base_delay_ms: 1000,
-        multiplier: 2.0,
-        max_delay_ms: 600_000,
-    }
-    .calculate_delay(u8::try_from(ordinal).unwrap_or(u8::MAX), 0.25)
+    let attempt = u8::try_from(ordinal).ok().and_then(NonZeroU8::new).unwrap_or(NonZeroU8::MAX);
+    u64::try_from(RETRY.delay(attempt, rand::random()).as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Store {

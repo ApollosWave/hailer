@@ -26,9 +26,7 @@ fn experiment(options: &ArmArgs) -> anyhow::Result<Armed> {
     let fault = match (options.fault.as_str(), options.delay_ms) {
         ("raise", None) => Fault::Raise,
         ("garble", None) if target != Target::Verifier => Fault::Garble,
-        ("delay", Some(ms)) if ms > 0 => {
-            Fault::Delay { ns: crate::budget::nanos(Duration::from_millis(ms)) }
-        }
+        ("delay", Some(ms)) if ms > 0 => Fault::Delay(Duration::from_millis(ms)),
         _ => anyhow::bail!(
             "fault must be raise, garble (not for verifier) or delay with a positive --delay-ms"
         ),
