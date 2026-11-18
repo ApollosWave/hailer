@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: x86_64-linux-gnu
+          - runner: ubuntu-24.04-arm
+            platform: aarch64-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    # Trixie is the deployment baseline (glibc 2.41), not the runner's libc.
+    container: ruby:4.0-trixie
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: hailer
+          POSTGRES_PASSWORD: hailer-test
+          POSTGRES_DB: hailer_test
+        options: >-
+          --health-cmd "pg_isready -U hailer -d hailer_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BUNDLE_FROZEN: "true"
+      BUNDLE_PATH: vendor/bundle
+      # Use the locked GNU dependency variants, as the slim runtime does.
+      BUNDLE_FORCE_RUBY_PLATFORM: "false"
+      EXPECTED_PLATFORM: ${{ matrix.platform }}
+      HAILER_TEST_DATABASE_URL: postgres://hailer:hailer-test@postgres:5432/hailer_test
+      RUST_TEST_THREADS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends pkg-config libclang-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Install locked Ruby dependencies
+        run: |
+          version=$(ruby -e 'puts File.read("Gemfile.lock").split("BUNDLED WITH").last.strip')
+          gem install bundler --version "$version" --no-document
+          # Checksum entries may be empty or stale (release-please bumps the
+          # version only). Populate them without changing locked versions,
+          # then install frozen.
+          cp Gemfile.lock /tmp/hailer-original.lock
+          BUNDLE_FROZEN=false bundle lock --add-checksums
+          ruby -rbundler -e '
+            parse = ->(path) { Bundler::LockfileParser.new(File.read(path)).specs.map { |s| [s.name, s.version, s.platform] } }
+            abort "locked dependencies changed" unless parse.call("/tmp/hailer-original.lock") == parse.call("Gemfile.lock")
+          '
+          bundle install
+      - name: Verify platform detection
+        run: ruby -Ilib -rhailer/binary -e 'abort "unexpected host" unless Hailer::Binary.platform == ENV.fetch("EXPECTED_PLATFORM")'
+      - name: Test
+        run: |
+          bundle exec rake test
+          cargo test --release --locked --features ses,postmark
+          cargo check --locked --features ses
+          cargo check --locked --features postmark
