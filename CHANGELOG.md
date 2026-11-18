@@ -7,6 +7,19 @@
 - Opt-in fault injection (`[rogue]`, `rogue-machines`): `hailer arm-experiment`/`disarm-experiment`/`list-experiments` against the provider, SQS feedback or the verifier, with a mandatory expiry of at most 24 hours. Migration `06_rogue_experiments`.
 - breaker-machines 0.22, behavior-machines 0.3, behavior-machines-circuit 0.4, chrono-machines 0.10, throttle-machines 0.5, state-machines 0.34: the whole family on one state-machines. Every other dependency at its latest compatible release.
 
+## [0.8.0](https://github.com/seuros/hailer/compare/v0.7.1...v0.8.0) (2026-11-18)
+
+
+### Features
+
+* supervise workers, budget sync sends, opt-in fault injection ([8aba181](https://github.com/seuros/hailer/commit/8aba18154bf3dd3867024b745b374135129f8eed))
+
+
+### Bug Fixes
+
+* machines crates at their latest releases; workers back off through chrono-machines ([8eb0ccd](https://github.com/seuros/hailer/commit/8eb0ccdb97682702710135fd9e4170f40a0edc84))
+* machines crates at their rebuilt releases ([8523c27](https://github.com/seuros/hailer/commit/8523c276ac7582103e9bf5558eb0804c6c827431))
+
 ## 0.7.1
 
 - `AWS_ENDPOINT_URL`, and `AWS_ENDPOINT_URL_SESV2`/`_SQS`/`_STS` before it, replace the AWS hosts again, as they did under the AWS SDK; `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` turns them off. 0.7.0 ignored them, so LocalStack and endpoint fixtures reached real AWS.
