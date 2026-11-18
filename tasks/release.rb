@@ -107,13 +107,19 @@ module HailerRelease
     end
   end
 
+  # One code for every push of a run, from GEM_OTP.
+  def otp
+    code = ENV.fetch('GEM_OTP', '')
+    code.empty? ? [] : ['--otp', code]
+  end
+
   def push_all(tag = nil)
     release_version = version(tag)
     artifacts = pending(fetch(tag), published_versions, release_version)
     require 'bundler'
     artifacts.each do |artifact|
       success = Bundler.with_unbundled_env do
-        system(Gem.ruby, '-S', 'gem', 'push', artifact.path, '--host', HOST)
+        system(Gem.ruby, '-S', 'gem', 'push', artifact.path, '--host', HOST, *otp)
       end
       raise Error, "not pushed: #{File.basename(artifact.path)}; rerun gems:push_all to resume" unless success
     end

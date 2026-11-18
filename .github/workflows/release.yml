@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Exact release tag created by release-please (e.g. v0.8.0)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "EXISTING release tag to rebuild (e.g. v0.8.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    uses: ./.github/workflows/linux-gems.yml
+    # The called workflow's own attach job (manual runs only) declares write.
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.tag }}
+
+  darwin:
+    name: arm64-darwin
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install Ruby and Rust (mise.toml)
+        uses: jdx/mise-action@v4
+      - run: bundle install --jobs 4
+      - name: Package
+        run: bundle exec rake native:package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hailer-arm64-darwin
+          path: pkg/hailer-*-arm64-darwin.gem
+          if-no-files-found: error
+
+  source:
+    name: source gem
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install Ruby (mise.toml)
+        uses: jdx/mise-action@v4
+        with:
+          install_args: ruby
+      - run: mkdir -p pkg && gem build hailer.gemspec --output "pkg/hailer-${TAG#v}.gem"
+        env:
+          TAG: ${{ inputs.tag }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hailer-ruby
+          path: pkg/*.gem
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, darwin, source]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: hailer-*
+          merge-multiple: true
+          path: pkg
+      - name: Attach gems and their checksums to the GitHub release (pushed to rubygems.org by hand)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          cd pkg
+          sha256sum -- *.gem > SHA256SUMS
+          gh release upload "$TAG" *.gem SHA256SUMS --clobber --repo "${{ github.repository }}"

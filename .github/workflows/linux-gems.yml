@@ -4,6 +4,12 @@ on:
   push:
     branches: [master, "feat/**"]
   pull_request:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build; the caller attaches the gems
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
